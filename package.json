@@ -3,9 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"vite\" \"node server.mjs\"",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "node server.mjs"
   },
   "dependencies": {
     "express": "^4.18.2",
