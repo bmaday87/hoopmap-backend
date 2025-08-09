@@ -1,6 +1,8 @@
 // --- server.mjs ---
-import express from 'express';
 import dotenv from 'dotenv';
+dotenv.config();
+
+import express from 'express';
 import fetch from 'node-fetch';
 import cors from 'cors';
 import compression from 'compression';
@@ -8,13 +10,11 @@ import LRU from 'lru-cache';
 import { Agent as HttpAgent } from 'http';
 import { Agent as HttpsAgent } from 'https';
 
-dotenv.config();
-
 const app = express();
 
 // Middleware
 app.use(cors());
-app.use(compression());
+app.use(compression()); // only once
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -73,9 +73,7 @@ app.get('/api/autocomplete', async (req, res) => {
   }
 
   try {
-    const url = `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(
-      q
-    )}&format=json`;
+    const url = `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(q)}&format=json`;
     const data = await fetchJSON(url);
     cache.set(key, data, { ttl: 1000 * 60 * 2 });
     res.set('Cache-Control', 'public, max-age=120');
@@ -99,9 +97,7 @@ app.get('/api/geocode', async (req, res) => {
   }
 
   try {
-    const url = `https://us1.locationiq.com/v1/search.php?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(
-      q
-    )}&format=json`;
+    const url = `https://us1.locationiq.com/v1/search.php?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(q)}&format=json`;
     const data = await fetchJSON(url);
     cache.set(key, data, { ttl: 1000 * 60 * 5 });
     res.set('Cache-Control', 'public, max-age=300');
@@ -135,7 +131,7 @@ app.post('/api/verify-captcha', async (req, res) => {
   }
 });
 
-// Optional: deep warm route (pings upstreams quickly)
+// Optional: deep warm route
 app.get('/warm', async (_req, res) => {
   try {
     await Promise.allSettled([
