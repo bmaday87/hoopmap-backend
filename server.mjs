@@ -1,0 +1,290 @@
+// --- server.mjs ---
+import dotenv from 'dotenv';
+dotenv.config();
+
+import express from 'express';
+import fetch from 'node-fetch';
+import cors from 'cors';
+import compression from 'compression';
+import LRU from 'lru-cache';
+import { Agent as HttpAgent } from 'http';
+import { Agent as HttpsAgent } from 'https';
+import { createClient } from '@supabase/supabase-js';
+
+// Express
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(compression());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Env (LocationIQ / reCAPTCHA)
+const LOCATIONIQ_API_KEY = process.env.VITE_LOCATIONIQ_API_KEY;
+const RECAPTCHA_SECRET   = process.env.RECAPTCHA_SECRET;
+
+// AI Blog / Supabase env
+const OPENAI_API_KEY        = process.env.OPENAI_API_KEY;
+const CRON_SECRET           = process.env.CRON_SECRET;
+const SUPABASE_URL          = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+const MODEL_NAME            = process.env.MODEL_NAME || 'gpt-4o-mini';
+
+// Supabase (service role for server-side inserts)
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
+
+// Keep-alive agents
+const httpAgent  = new HttpAgent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10_000 });
+const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10_000 });
+
+// Tiny cache (LRU)
+const cache = new LRU({
+  max: 500,
+  ttl: 1000 * 60 * 3, // default 3 min
+});
+
+// Health
+app.get('/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.status(200).json({ ok: true, uptime: process.uptime() });
+});
+
+// Helper: fetch JSON with timeout + keep-alive
+async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const isHttps = url.startsWith('https:');
+    const resp = await fetch(url, {
+      agent: isHttps ? httpsAgent : httpAgent,
+      signal: controller.signal,
+      ...opts,
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(`Fetch failed ${resp.status}: ${text || resp.statusText}`);
+    }
+    return await resp.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Autocomplete (cached ~2 min)
+app.get('/api/autocomplete', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'Missing query' });
+
+  const key = `ac:${q}`;
+  const hit = cache.get(key);
+  if (hit) {
+    res.set('Cache-Control', 'public, max-age=120');
+    return res.json(hit);
+  }
+
+  try {
+    const url = `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(q)}&format=json`;
+    const data = await fetchJSON(url);
+    cache.set(key, data, { ttl: 1000 * 60 * 2 });
+    res.set('Cache-Control', 'public, max-age=120');
+    res.json(data);
+  } catch (err) {
+    console.error('Autocomplete error:', err.message);
+    res.status(502).json({ error: 'Autocomplete fetch failed' });
+  }
+});
+
+// Geocode (cached ~5 min)
+app.get('/api/geocode', async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'Missing query' });
+
+  const key = `geo:${q}`;
+  const hit = cache.get(key);
+  if (hit) {
+    res.set('Cache-Control', 'public, max-age=300');
+    return res.json(hit);
+  }
+
+  try {
+    const url = `https://us1.locationiq.com/v1/search.php?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(q)}&format=json`;
+    const data = await fetchJSON(url);
+    cache.set(key, data, { ttl: 1000 * 60 * 5 });
+    res.set('Cache-Control', 'public, max-age=300');
+    res.json(data);
+  } catch (err) {
+    console.error('Geocoding error:', err.message);
+    res.status(502).json({ error: 'Geocoding fetch failed' });
+  }
+});
+
+// reCAPTCHA verification
+app.post('/api/verify-captcha', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'Missing token' });
+
+  try {
+    const data = await fetchJSON(
+      'https://www.google.com/recaptcha/api/siteverify',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `secret=${RECAPTCHA_SECRET}&response=${token}`,
+      },
+      5000
+    );
+    res.set('Cache-Control', 'no-store');
+    res.json(data);
+  } catch (err) {
+    console.error('reCAPTCHA error:', err.message);
+    res.status(502).json({ error: 'Verification failed' });
+  }
+});
+
+// Optional: deep warm route
+app.get('/warm', async (_req, res) => {
+  try {
+    await Promise.allSettled([
+      fetchJSON(`https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=ping&format=json`, {}, 3000),
+      fetchJSON(`https://www.google.com/recaptcha/api/siteverify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: `secret=${RECAPTCHA_SECRET}&response=dummy`,
+      }, 3000),
+    ]);
+    res.json({ ok: true });
+  } catch {
+    res.json({ ok: true }); // don’t fail warmups
+  }
+});
+
+/* =========================
+   AI BLOG WRITER ENDPOINT
+   ========================= */
+
+// Utilities
+const slugify = (s) =>
+  s.toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 90);
+
+const TOPIC_POOL = [
+  'Best outdoor courts in Minneapolis for pickup runs',
+  'How to organize a 3v3 at your local park (checklist)',
+  'Beginner shooting drills you can do solo',
+  'How to find indoor open gym times in your city',
+  'Gear guide: budget shoes that grip blacktop',
+  'Safety and etiquette at public courts',
+  'How we’re mapping courts (data process + roadmap)',
+  'Community spotlight: user-submitted courts this week',
+  'Seasonal prep: winter hooping options & indoor passes',
+  'Pro tips: stretching and warm-ups to avoid injury',
+];
+
+async function pickTopic() {
+  const { data: posts } = await supabase
+    .from('posts')
+    .select('slug')
+    .order('published_at', { ascending: false })
+    .limit(200);
+  const existing = new Set((posts || []).map((p) => p.slug));
+  for (const t of TOPIC_POOL) {
+    if (!existing.has(slugify(t))) return t;
+  }
+  return `${TOPIC_POOL[0]} (${new Date().toISOString().slice(0,10)})`;
+}
+
+async function openaiChat(system, user) {
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is missing');
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: MODEL_NAME,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      temperature: 0.8,
+    }),
+  });
+  if (!resp.ok) throw new Error(`[OpenAI] ${resp.status} ${await resp.text()}`);
+  const json = await resp.json();
+  return json.choices?.[0]?.message?.content || '';
+}
+
+async function generatePost(topic) {
+  const system = `You write for HoopMap's "Courtside" blog. Audience: casual hoopers. Tone: practical, upbeat. Output Markdown only.`;
+  const prompt = `Write an 800–1200 word post about "${topic}".
+- Start with a 1–2 sentence excerpt delimited by <<<excerpt>>> ... <<<end>>>
+- Use H2s for sections; lists where helpful
+- End with "Tags: a, b, c" (5 tags max)
+- Do NOT include a title in the body`;
+
+  const md = await openaiChat(system, prompt);
+  if (!md) throw new Error('No content returned from OpenAI');
+
+  const excerptMatch = md.match(/<<<excerpt>>>([\s\S]*?)<<<end>>>/i);
+  const excerpt = excerptMatch ? excerptMatch[1].trim() : '';
+  const body = md.replace(/<<<excerpt>>>([\s\S]*?)<<<end>>>/i, '').trim();
+
+  const tagsLine = body.match(/^\s*Tags:\s*(.+)$/im)?.[1] || '';
+  const tags = tagsLine
+    ? tagsLine.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+    : [];
+  const content = body.replace(/^\s*Tags:\s*.+$/im, '').trim();
+
+  return { excerpt, content, tags };
+}
+
+// POST /api/auto-post  (secured by X-Cron-Secret)
+app.post('/api/auto-post', async (req, res) => {
+  try {
+    const secret = req.headers['x-cron-secret'] || req.query.secret;
+    if (secret !== CRON_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+      return res.status(500).json({ error: 'Supabase env missing' });
+    }
+
+    const topic = (req.body && req.body.topic) || (await pickTopic());
+    const title = (req.body && req.body.title) || topic;
+    const slug  = slugify(title);
+
+    const { excerpt, content, tags } = await generatePost(topic);
+    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(title.slice(0,50))}`;
+    const now = new Date().toISOString();
+
+    const { error } = await supabase.from('posts').insert([
+      {
+        title,
+        slug,
+        excerpt,
+        content,
+        hero_url,
+        category: 'Guide',
+        tags,
+        published_at: now,
+        updated_at: now,
+      },
+    ]);
+    if (error) throw error;
+
+    res.json({ ok: true, title, slug, tags });
+  } catch (err) {
+    console.error('[auto-post]', err.message || err);
+    res.status(500).json({ error: err.message || 'Failed' });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Proxy server running on port ${PORT}`);
+});
