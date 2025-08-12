@@ -29,6 +29,7 @@ const CRON_SECRET           = process.env.CRON_SECRET;
 const SUPABASE_URL          = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 const MODEL_NAME            = process.env.MODEL_NAME || 'gpt-4o-mini';
+const MAX_POSTS_PER_MONTH   = Number(process.env.MAX_POSTS_PER_MONTH || 0); // 0 = unlimited
 
 // Supabase (service role for server-side inserts)
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
@@ -282,6 +283,24 @@ async function ensureUniqueSlug(slugBase, limit = 50) {
   return `${slugBase}-${Date.now()}`;
 }
 
+// Month range & count helpers (UTC)
+function getMonthRangeUTC(date = new Date()) {
+  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0));
+  const end = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1, 0, 0, 0));
+  return { start, end };
+}
+
+async function countPostsThisMonth() {
+  const { start, end } = getMonthRangeUTC(new Date());
+  const { count, error } = await supabase
+    .from('posts')
+    .select('id', { count: 'exact', head: true })
+    .gte('published_at', start.toISOString())
+    .lt('published_at', end.toISOString());
+  if (error) throw error;
+  return count || 0;
+}
+
 // POST /api/auto-post (secured by X-Cron-Secret or ?secret=)
 app.post('/api/auto-post', async (req, res) => {
   try {
@@ -291,6 +310,18 @@ app.post('/api/auto-post', async (req, res) => {
     }
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
       return res.status(500).json({ error: 'Supabase env missing' });
+    }
+
+    // Soft monthly limit
+    if (MAX_POSTS_PER_MONTH > 0) {
+      const count = await countPostsThisMonth();
+      if (count >= MAX_POSTS_PER_MONTH) {
+        return res.status(429).json({
+          error: 'Monthly post limit reached',
+          limit: MAX_POSTS_PER_MONTH,
+          currentMonthCount: count,
+        });
+      }
     }
 
     const topic = (req.body && req.body.topic) || (await pickTopic());
@@ -334,6 +365,18 @@ app.get('/api/auto-post-test', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    // Soft monthly limit
+    if (MAX_POSTS_PER_MONTH > 0) {
+      const count = await countPostsThisMonth();
+      if (count >= MAX_POSTS_PER_MONTH) {
+        return res.status(429).json({
+          error: 'Monthly post limit reached',
+          limit: MAX_POSTS_PER_MONTH,
+          currentMonthCount: count,
+        });
+      }
+    }
+
     const topic = req.query.topic || (await pickTopic());
     const title = req.query.title || topic;
     const base = slugify(title);
@@ -375,6 +418,7 @@ app.get('/env-check', (_req, res) => {
     SUPABASE_URL: !!process.env.SUPABASE_URL,
     SUPABASE_SERVICE_ROLE: !!process.env.SUPABASE_SERVICE_ROLE,
     MODEL_NAME: process.env.MODEL_NAME || null,
+    MAX_POSTS_PER_MONTH: MAX_POSTS_PER_MONTH || 0,
   });
 });
 
@@ -382,14 +426,6 @@ app.get('/env-check', (_req, res) => {
    POSTS STATS & COST ESTIMATE
    ========================= */
 
-// simple month range in UTC
-function getMonthRangeUTC(date = new Date()) {
-  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0));
-  const end = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1, 0, 0, 0));
-  return { start, end };
-}
-
-// rough cost model (Aug 2025): gpt-4o-mini
 const PRICING = {
   model: MODEL_NAME,
   input_per_1k: 0.0006,   // $/1k tokens
@@ -408,14 +444,11 @@ function estimateCostPerPostUSD() {
 app.get('/posts-stats', async (_req, res) => {
   try {
     const { start, end } = getMonthRangeUTC(new Date());
-    const startISO = start.toISOString();
-    const endISO = end.toISOString();
-
     const { count, error } = await supabase
       .from('posts')
       .select('id', { count: 'exact', head: true })
-      .gte('published_at', startISO)
-      .lt('published_at', endISO);
+      .gte('published_at', start.toISOString())
+      .lt('published_at', end.toISOString());
 
     if (error) throw error;
 
@@ -423,11 +456,12 @@ app.get('/posts-stats', async (_req, res) => {
     const total = +((count || 0) * perPost).toFixed(4);
 
     res.json({
-      monthStartUTC: startISO,
-      monthEndUTC: endISO,
+      monthStartUTC: start.toISOString(),
+      monthEndUTC: end.toISOString(),
       postsThisMonth: count || 0,
       estCostPerPostUSD: perPost,
       estMonthlyCostUSD: total,
+      maxPostsPerMonth: MAX_POSTS_PER_MONTH || 0,
       pricing: {
         model: PRICING.model,
         input_per_1k_usd: PRICING.input_per_1k,
