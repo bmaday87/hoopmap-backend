@@ -13,48 +13,79 @@ import { createClient } from '@supabase/supabase-js';
 
 const app = express();
 
-// Middleware
+/* =========================
+   Middleware
+   ========================= */
 app.use(cors());
 app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Env (LocationIQ / reCAPTCHA)
-const LOCATIONIQ_API_KEY = process.env.VITE_LOCATIONIQ_API_KEY;
-const RECAPTCHA_SECRET   = process.env.RECAPTCHA_SECRET;
+/* =========================
+   Env
+   ========================= */
+// LocationIQ / reCAPTCHA
+const LOCATIONIQ_TOKEN      = (process.env.LOCATIONIQ_TOKEN || '').trim();
+const RECAPTCHA_SECRET      = (process.env.RECAPTCHA_SECRET || '').trim();
 
 // AI Blog / Supabase env
-const OPENAI_API_KEY        = process.env.OPENAI_API_KEY;
-const CRON_SECRET           = process.env.CRON_SECRET;
-const SUPABASE_URL          = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+const OPENAI_API_KEY        = (process.env.OPENAI_API_KEY || '').trim();
+const CRON_SECRET           = (process.env.CRON_SECRET || '').trim();
+const SUPABASE_URL          = (process.env.SUPABASE_URL || '').trim();
+const SUPABASE_SERVICE_ROLE = (process.env.SUPABASE_SERVICE_ROLE || '').trim();
 const MODEL_NAME            = process.env.MODEL_NAME || 'gpt-4o-mini';
 const MAX_POSTS_PER_MONTH   = Number(process.env.MAX_POSTS_PER_MONTH || 0); // 0 = unlimited
 
-// Supabase (service role for server-side inserts)
+// Guard critical envs early (don’t crash, but log)
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.warn('[boot] Missing Supabase URL or Service Role key. Some routes will fail until set.');
+}
+
+/* =========================
+   Supabase (service role for server-side writes)
+   ========================= */
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-// Keep-alive agents
+/* =========================
+   Keep-alive agents & tiny cache
+   ========================= */
 const httpAgent  = new HttpAgent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10_000 });
 const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10_000 });
 
-// Tiny cache (LRU)
-const cache = new LRU({ max: 500, ttl: 1000 * 60 * 3 });
+const cache = new LRU({
+  max: 500,
+  ttl: 1000 * 60 * 3 // default 3 min
+});
 
-// Boot log
+/* =========================
+   Boot log
+   ========================= */
 console.log(
   '[boot]',
   new Date().toISOString(),
-  'routes: /health /env-check /posts-stats /api/autocomplete /api/geocode /api/verify-captcha /warm /api/auto-post /api/auto-post-test'
+  'routes:',
+  '/health',
+  '/env-check',
+  '/posts-stats',
+  '/api/autocomplete',
+  '/api/geocode',
+  '/api/verify-captcha',
+  '/warm',
+  '/api/auto-post',
+  '/api/auto-post-test'
 );
 
-// Health
+/* =========================
+   Health
+   ========================= */
 app.get('/health', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.status(200).json({ ok: true, uptime: process.uptime() });
 });
 
-// Helper: fetch JSON with timeout + keep-alive
+/* =========================
+   Helper: fetch JSON with timeout + keep-alive
+   ========================= */
 async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -63,7 +94,7 @@ async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
     const resp = await fetch(url, {
       agent: isHttps ? httpsAgent : httpAgent,
       signal: controller.signal,
-      ...opts,
+      ...opts
     });
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
@@ -76,98 +107,126 @@ async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
 }
 
 /* =========================
-   LocationIQ proxy routes
+   LocationIQ proxy (server-side token)
    ========================= */
 
+// Autocomplete (suggestions)
 app.get('/api/autocomplete', async (req, res) => {
-  const { q } = req.query;
-  if (!q) return res.status(400).json({ error: 'Missing query' });
-
-  const key = `ac:${q}`;
-  const hit = cache.get(key);
-  if (hit) {
-    res.set('Cache-Control', 'public, max-age=120');
-    return res.json(hit);
-  }
-
   try {
-    const url = `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(
-      q
-    )}&format=json`;
+    if (!LOCATIONIQ_TOKEN) {
+      return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
+    }
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.status(400).json({ error: 'Missing query' });
+
+    const limit = Math.min(parseInt(req.query.limit || '8', 10) || 8, 15);
+    const countrycodes = (req.query.countrycodes || 'us').toString();
+
+    const key = `ac:${q}:${limit}:${countrycodes}`;
+    const hit = cache.get(key);
+    if (hit) {
+      res.set('Cache-Control', 'public, max-age=120');
+      return res.json(hit);
+    }
+
+    const url = `https://us1.locationiq.com/v1/autocomplete?key=${encodeURIComponent(
+      LOCATIONIQ_TOKEN
+    )}&q=${encodeURIComponent(q)}&limit=${limit}&normalizeaddress=1&dedupe=1&countrycodes=${encodeURIComponent(
+      countrycodes
+    )}`;
+
     const data = await fetchJSON(url);
     cache.set(key, data, { ttl: 1000 * 60 * 2 });
     res.set('Cache-Control', 'public, max-age=120');
     res.json(data);
   } catch (err) {
-    console.error('Autocomplete error:', err.message);
+    console.error('Autocomplete error:', err.message || err);
     res.status(502).json({ error: 'Autocomplete fetch failed' });
   }
 });
 
+// Geocode (full search)
 app.get('/api/geocode', async (req, res) => {
-  const { q } = req.query;
-  if (!q) return res.status(400).json({ error: 'Missing query' });
-
-  const key = `geo:${q}`;
-  const hit = cache.get(key);
-  if (hit) {
-    res.set('Cache-Control', 'public, max-age=300');
-    return res.json(hit);
-  }
-
   try {
-    const url = `https://us1.locationiq.com/v1/search.php?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(
-      q
-    )}&format=json`;
+    if (!LOCATIONIQ_TOKEN) {
+      return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
+    }
+    const q = (req.query.q || '').toString().trim();
+    if (!q) return res.status(400).json({ error: 'Missing query' });
+
+    const key = `geo:${q}`;
+    const hit = cache.get(key);
+    if (hit) {
+      res.set('Cache-Control', 'public, max-age=300');
+      return res.json(hit);
+    }
+
+    const url = `https://us1.locationiq.com/v1/search.php?key=${encodeURIComponent(
+      LOCATIONIQ_TOKEN
+    )}&q=${encodeURIComponent(q)}&format=json&normalizeaddress=1&dedupe=1`;
+
     const data = await fetchJSON(url);
     cache.set(key, data, { ttl: 1000 * 60 * 5 });
     res.set('Cache-Control', 'public, max-age=300');
     res.json(data);
   } catch (err) {
-    console.error('Geocoding error:', err.message);
+    console.error('Geocoding error:', err.message || err);
     res.status(502).json({ error: 'Geocoding fetch failed' });
   }
 });
 
+/* =========================
+   reCAPTCHA verify (server-side)
+   ========================= */
 app.post('/api/verify-captcha', async (req, res) => {
-  const { token } = req.body;
-  if (!token) return res.status(400).json({ error: 'Missing token' });
-
   try {
+    const token = (req.body?.token || '').toString();
+    if (!token) return res.status(400).json({ error: 'Missing token' });
+    if (!RECAPTCHA_SECRET) return res.status(500).json({ error: 'Missing RECAPTCHA_SECRET' });
+
     const data = await fetchJSON(
       'https://www.google.com/recaptcha/api/siteverify',
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `secret=${RECAPTCHA_SECRET}&response=${token}`,
+        body: `secret=${encodeURIComponent(RECAPTCHA_SECRET)}&response=${encodeURIComponent(token)}`
       },
       5000
     );
     res.set('Cache-Control', 'no-store');
     res.json(data);
   } catch (err) {
-    console.error('reCAPTCHA error:', err.message);
+    console.error('reCAPTCHA error:', err.message || err);
     res.status(502).json({ error: 'Verification failed' });
   }
 });
 
+/* =========================
+   Warm upstreams (optional)
+   ========================= */
 app.get('/warm', async (_req, res) => {
   try {
     await Promise.allSettled([
-      fetchJSON(
-        `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=ping&format=json`,
-        {},
-        3000
-      ),
-      fetchJSON(
-        `https://www.google.com/recaptcha/api/siteverify`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: `secret=${RECAPTCHA_SECRET}&response=dummy`,
-        },
-        3000
-      ),
+      LOCATIONIQ_TOKEN
+        ? fetchJSON(
+            `https://us1.locationiq.com/v1/autocomplete?key=${encodeURIComponent(
+              LOCATIONIQ_TOKEN
+            )}&q=ping&limit=1`,
+            {},
+            3000
+          )
+        : Promise.resolve(),
+      RECAPTCHA_SECRET
+        ? fetchJSON(
+            'https://www.google.com/recaptcha/api/siteverify',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: `secret=${encodeURIComponent(RECAPTCHA_SECRET)}&response=dummy`
+            },
+            3000
+          )
+        : Promise.resolve()
     ]);
     res.json({ ok: true });
   } catch {
@@ -199,7 +258,7 @@ const TOPIC_POOL = [
   'How we’re mapping courts (data process + roadmap)',
   'Community spotlight: user-submitted courts this week',
   'Seasonal prep: winter hooping options & indoor passes',
-  'Pro tips: stretching and warm-ups to avoid injury',
+  'Pro tips: stretching and warm-ups to avoid injury'
 ];
 
 async function pickTopic() {
@@ -213,7 +272,6 @@ async function pickTopic() {
   for (const t of TOPIC_POOL) {
     if (!existing.has(slugify(t))) return t;
   }
-  // Fallback: append date so it’s always new
   return `${TOPIC_POOL[0]} ${new Date().toISOString().slice(0, 10)}`;
 }
 
@@ -223,16 +281,16 @@ async function openaiChat(system, user) {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify({
       model: MODEL_NAME,
       messages: [
         { role: 'system', content: system },
-        { role: 'user', content: user },
+        { role: 'user', content: user }
       ],
-      temperature: 0.8,
-    }),
+      temperature: 0.8
+    })
   });
   if (!resp.ok) throw new Error(`[OpenAI] ${resp.status} ${await resp.text()}`);
   const json = await resp.json();
@@ -256,7 +314,10 @@ async function generatePost(topic) {
 
   const tagsLine = body.match(/^\s*Tags:\s*(.+)$/im)?.[1] || '';
   const tags = tagsLine
-    ? tagsLine.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
+    ? tags
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean)
     : [];
   const content = body.replace(/^\s*Tags:\s*.+$/im, '').trim();
 
@@ -304,6 +365,7 @@ async function countPostsThisMonth() {
 // POST /api/auto-post (secured by X-Cron-Secret or ?secret=)
 app.post('/api/auto-post', async (req, res) => {
   try {
+    if (!CRON_SECRET) return res.status(500).json({ error: 'Missing CRON_SECRET' });
     const secret = req.headers['x-cron-secret'] || req.query.secret;
     if (secret !== CRON_SECRET) {
       return res.status(401).json({ error: 'Unauthorized' });
@@ -319,7 +381,7 @@ app.post('/api/auto-post', async (req, res) => {
         return res.status(429).json({
           error: 'Monthly post limit reached',
           limit: MAX_POSTS_PER_MONTH,
-          currentMonthCount: count,
+          currentMonthCount: count
         });
       }
     }
@@ -345,8 +407,8 @@ app.post('/api/auto-post', async (req, res) => {
         category: 'Guide',
         tags,
         published_at: now,
-        updated_at: now,
-      },
+        updated_at: now
+      }
     ]);
     if (error) throw error;
 
@@ -360,19 +422,19 @@ app.post('/api/auto-post', async (req, res) => {
 // GET /api/auto-post-test (browser-friendly)
 app.get('/api/auto-post-test', async (req, res) => {
   try {
+    if (!CRON_SECRET) return res.status(500).json({ error: 'Missing CRON_SECRET' });
     const secret = req.query.secret;
-    if (secret !== process.env.CRON_SECRET) {
+    if (secret !== CRON_SECRET) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Soft monthly limit
     if (MAX_POSTS_PER_MONTH > 0) {
       const count = await countPostsThisMonth();
       if (count >= MAX_POSTS_PER_MONTH) {
         return res.status(429).json({
           error: 'Monthly post limit reached',
           limit: MAX_POSTS_PER_MONTH,
-          currentMonthCount: count,
+          currentMonthCount: count
         });
       }
     }
@@ -398,8 +460,8 @@ app.get('/api/auto-post-test', async (req, res) => {
         category: 'Guide',
         tags,
         published_at: now,
-        updated_at: now,
-      },
+        updated_at: now
+      }
     ]);
     if (error) throw error;
 
@@ -410,22 +472,25 @@ app.get('/api/auto-post-test', async (req, res) => {
   }
 });
 
-// Env check (booleans only)
+/* =========================
+   Env check (booleans only)
+   ========================= */
 app.get('/env-check', (_req, res) => {
   res.json({
-    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-    CRON_SECRET: !!process.env.CRON_SECRET,
-    SUPABASE_URL: !!process.env.SUPABASE_URL,
-    SUPABASE_SERVICE_ROLE: !!process.env.SUPABASE_SERVICE_ROLE,
-    MODEL_NAME: process.env.MODEL_NAME || null,
+    OPENAI_API_KEY: !!OPENAI_API_KEY,
+    CRON_SECRET: !!CRON_SECRET,
+    SUPABASE_URL: !!SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE,
+    MODEL_NAME,
     MAX_POSTS_PER_MONTH: MAX_POSTS_PER_MONTH || 0,
+    LOCATIONIQ_TOKEN: !!LOCATIONIQ_TOKEN,
+    RECAPTCHA_SECRET: !!RECAPTCHA_SECRET
   });
 });
 
 /* =========================
    POSTS STATS & COST ESTIMATE
    ========================= */
-
 const PRICING = {
   model: MODEL_NAME,
   input_per_1k: 0.0006,   // $/1k tokens
@@ -435,12 +500,11 @@ const PRICING = {
 };
 
 function estimateCostPerPostUSD() {
-  const inputCost  = (PRICING.prompt_tokens / 1000)    * PRICING.input_per_1k;
+  const inputCost  = (PRICING.prompt_tokens / 1000)     * PRICING.input_per_1k;
   const outputCost = (PRICING.completion_tokens / 1000) * PRICING.output_per_1k;
   return +(inputCost + outputCost).toFixed(4);
 }
 
-// GET /posts-stats — count this month's posts + estimated cost
 app.get('/posts-stats', async (_req, res) => {
   try {
     const { start, end } = getMonthRangeUTC(new Date());
@@ -449,7 +513,6 @@ app.get('/posts-stats', async (_req, res) => {
       .select('id', { count: 'exact', head: true })
       .gte('published_at', start.toISOString())
       .lt('published_at', end.toISOString());
-
     if (error) throw error;
 
     const perPost = estimateCostPerPostUSD();
@@ -467,8 +530,8 @@ app.get('/posts-stats', async (_req, res) => {
         input_per_1k_usd: PRICING.input_per_1k,
         output_per_1k_usd: PRICING.output_per_1k,
         prompt_tokens_est: PRICING.prompt_tokens,
-        completion_tokens_est: PRICING.completion_tokens,
-      },
+        completion_tokens_est: PRICING.completion_tokens
+      }
     });
   } catch (err) {
     console.error('[posts-stats]', err.message || err);
@@ -476,8 +539,10 @@ app.get('/posts-stats', async (_req, res) => {
   }
 });
 
-// Start server
+/* =========================
+   Start server
+   ========================= */
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`Proxy server running on port ${PORT}`);
+  console.log(`API listening on :${PORT}`);
 });
