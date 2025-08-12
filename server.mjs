@@ -18,73 +18,57 @@ const app = express();
    ========================= */
 app.use(cors());
 app.use(compression());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 /* =========================
    Env
    ========================= */
-// LocationIQ / reCAPTCHA
-const LOCATIONIQ_TOKEN      = (process.env.LOCATIONIQ_TOKEN || '').trim();
-const RECAPTCHA_SECRET      = (process.env.RECAPTCHA_SECRET || '').trim();
-
-// AI Blog / Supabase env
 const OPENAI_API_KEY        = (process.env.OPENAI_API_KEY || '').trim();
 const CRON_SECRET           = (process.env.CRON_SECRET || '').trim();
+
 const SUPABASE_URL          = (process.env.SUPABASE_URL || '').trim();
 const SUPABASE_SERVICE_ROLE = (process.env.SUPABASE_SERVICE_ROLE || '').trim();
+
+const RECAPTCHA_SECRET      = (process.env.RECAPTCHA_SECRET || '').trim();
+
+const LOCATIONIQ_TOKEN      = (process.env.LOCATIONIQ_TOKEN || '').trim();
+const LOCATIONIQ_REGION     = (process.env.LOCATIONIQ_REGION || 'us1').trim(); // 'us1' or 'eu1'
+const LI_BASE               = `https://${LOCATIONIQ_REGION}.locationiq.com/v1`;
+
 const MODEL_NAME            = process.env.MODEL_NAME || 'gpt-4o-mini';
 const MAX_POSTS_PER_MONTH   = Number(process.env.MAX_POSTS_PER_MONTH || 0); // 0 = unlimited
 
-// Guard critical envs early (don’t crash, but log)
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-  console.warn('[boot] Missing Supabase URL or Service Role key. Some routes will fail until set.');
-}
-
 /* =========================
-   Supabase (service role for server-side writes)
+   Supabase Client (service role)
    ========================= */
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.warn('[boot] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE');
+}
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
 /* =========================
-   Keep-alive agents & tiny cache
+   Keep-alive agents & small cache
    ========================= */
 const httpAgent  = new HttpAgent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10_000 });
 const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10_000 });
 
-const cache = new LRU({
-  max: 500,
-  ttl: 1000 * 60 * 3 // default 3 min
-});
+const cache = new LRU({ max: 500, ttl: 1000 * 60 * 3 }); // default 3m
 
 /* =========================
    Boot log
    ========================= */
-console.log(
-  '[boot]',
-  new Date().toISOString(),
-  'routes:',
-  '/health',
-  '/env-check',
-  '/posts-stats',
-  '/api/autocomplete',
-  '/api/geocode',
-  '/api/verify-captcha',
-  '/warm',
-  '/api/auto-post',
-  '/api/auto-post-test'
-);
-
-/* =========================
-   Health
-   ========================= */
-app.get('/health', (_req, res) => {
-  res.set('Cache-Control', 'no-store');
-  res.status(200).json({ ok: true, uptime: process.uptime() });
+console.log('[boot]', new Date().toISOString(), {
+  routes: [
+    '/health', '/env-check', '/posts-stats',
+    '/api/autocomplete', '/api/geocode', '/api/verify-captcha',
+    '/warm', '/api/auto-post', '/api/auto-post-test'
+  ],
+  LOCATIONIQ: { present: !!LOCATIONIQ_TOKEN, region: LOCATIONIQ_REGION }
 });
 
 /* =========================
-   Helper: fetch JSON with timeout + keep-alive
+   Utilities
    ========================= */
 async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
   const controller = new AbortController();
@@ -94,7 +78,7 @@ async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
     const resp = await fetch(url, {
       agent: isHttps ? httpsAgent : httpAgent,
       signal: controller.signal,
-      ...opts
+      ...opts,
     });
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
@@ -106,77 +90,111 @@ async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
   }
 }
 
+async function fetchWithDiagnostics(url, opts = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      ...opts,
+      signal: controller.signal,
+      headers: { 'User-Agent': 'HoopMap/1.0', ...(opts.headers || {}) }
+    });
+    const text = await resp.text();
+    let json; try { json = JSON.parse(text); } catch { json = null; }
+    return { ok: resp.ok, status: resp.status, json, text };
+  } catch (e) {
+    return { ok: false, status: 0, json: null, text: String(e) };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /* =========================
-   LocationIQ proxy (server-side token)
+   Health
+   ========================= */
+app.get('/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.status(200).json({ ok: true, uptime: process.uptime() });
+});
+
+/* =========================
+   LocationIQ proxy
    ========================= */
 
-// Autocomplete (suggestions)
+// Autocomplete (text suggestions)
 app.get('/api/autocomplete', async (req, res) => {
   try {
-    if (!LOCATIONIQ_TOKEN) {
-      return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
-    }
+    if (!LOCATIONIQ_TOKEN) return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
+
     const q = (req.query.q || '').toString().trim();
     if (!q) return res.status(400).json({ error: 'Missing query' });
 
     const limit = Math.min(parseInt(req.query.limit || '8', 10) || 8, 15);
     const countrycodes = (req.query.countrycodes || 'us').toString();
 
-    const key = `ac:${q}:${limit}:${countrycodes}`;
-    const hit = cache.get(key);
+    const cacheKey = `ac:${q}:${limit}:${countrycodes}`;
+    const hit = cache.get(cacheKey);
     if (hit) {
       res.set('Cache-Control', 'public, max-age=120');
       return res.json(hit);
     }
 
-    const url = `https://us1.locationiq.com/v1/autocomplete?key=${encodeURIComponent(
+    const url = `${LI_BASE}/autocomplete?key=${encodeURIComponent(
       LOCATIONIQ_TOKEN
-    )}&q=${encodeURIComponent(q)}&limit=${limit}&normalizeaddress=1&dedupe=1&countrycodes=${encodeURIComponent(
-      countrycodes
-    )}`;
+    )}&q=${encodeURIComponent(q)}&limit=${limit}&normalizeaddress=1&dedupe=1&countrycodes=${encodeURIComponent(countrycodes)}`;
 
-    const data = await fetchJSON(url);
-    cache.set(key, data, { ttl: 1000 * 60 * 2 });
-    res.set('Cache-Control', 'public, max-age=120');
-    res.json(data);
-  } catch (err) {
-    console.error('Autocomplete error:', err.message || err);
+    const r = await fetchWithDiagnostics(url, {}, 8000);
+    if (!r.ok) {
+      console.error('[autocomplete] upstream', r.status, r.text?.slice(0, 300));
+      return res.status(r.status || 502).json({ error: 'Upstream error', detail: r.text?.slice(0, 200) });
+    }
+
+    cache.set(cacheKey, r.json, { ttl: 1000 * 60 * 2 });
+    res.set('Cache-Control', 'public, max-age=120').json(r.json);
+  } catch (e) {
+    console.error('[autocomplete] proxy error', e);
     res.status(502).json({ error: 'Autocomplete fetch failed' });
   }
 });
 
-// Geocode (full search)
+// Geocode (text forward OR "lat,lon" reverse)
 app.get('/api/geocode', async (req, res) => {
   try {
-    if (!LOCATIONIQ_TOKEN) {
-      return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
+    if (!LOCATIONIQ_TOKEN) return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
+
+    const qRaw = (req.query.q || '').toString().trim();
+    if (!qRaw) return res.status(400).json({ error: 'Missing query' });
+
+    // detect coords ("lat,lon")
+    const m = qRaw.match(/^\s*(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)\s*$/);
+    let url;
+
+    if (m) {
+      const lat = m[1], lon = m[3];
+      url = `${LI_BASE}/reverse.php?key=${encodeURIComponent(
+        LOCATIONIQ_TOKEN
+      )}&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&format=json&normalizeaddress=1`;
+    } else {
+      url = `${LI_BASE}/search.php?key=${encodeURIComponent(
+        LOCATIONIQ_TOKEN
+      )}&q=${encodeURIComponent(qRaw)}&format=json&normalizeaddress=1&dedupe=1`;
     }
-    const q = (req.query.q || '').toString().trim();
-    if (!q) return res.status(400).json({ error: 'Missing query' });
 
-    const key = `geo:${q}`;
-    const hit = cache.get(key);
-    if (hit) {
-      res.set('Cache-Control', 'public, max-age=300');
-      return res.json(hit);
+    const r = await fetchWithDiagnostics(url, {}, 8000);
+    if (!r.ok) {
+      console.error('[geocode] upstream', r.status, r.text?.slice(0, 300));
+      return res.status(r.status || 502).json({ error: 'Upstream error', detail: r.text?.slice(0, 200) });
     }
 
-    const url = `https://us1.locationiq.com/v1/search.php?key=${encodeURIComponent(
-      LOCATIONIQ_TOKEN
-    )}&q=${encodeURIComponent(q)}&format=json&normalizeaddress=1&dedupe=1`;
-
-    const data = await fetchJSON(url);
-    cache.set(key, data, { ttl: 1000 * 60 * 5 });
-    res.set('Cache-Control', 'public, max-age=300');
-    res.json(data);
-  } catch (err) {
-    console.error('Geocoding error:', err.message || err);
-    res.status(502).json({ error: 'Geocoding fetch failed' });
+    res.set('Cache-Control', 'public, max-age=300').json(r.json);
+  } catch (e) {
+    console.error('[geocode] proxy error', e);
+    res.status(502).json({ error: 'Geocode proxy failed' });
   }
 });
 
 /* =========================
-   reCAPTCHA verify (server-side)
+   reCAPTCHA verify
    ========================= */
 app.post('/api/verify-captcha', async (req, res) => {
   try {
@@ -202,30 +220,20 @@ app.post('/api/verify-captcha', async (req, res) => {
 });
 
 /* =========================
-   Warm upstreams (optional)
+   Warm upstreams
    ========================= */
 app.get('/warm', async (_req, res) => {
   try {
     await Promise.allSettled([
       LOCATIONIQ_TOKEN
-        ? fetchJSON(
-            `https://us1.locationiq.com/v1/autocomplete?key=${encodeURIComponent(
-              LOCATIONIQ_TOKEN
-            )}&q=ping&limit=1`,
-            {},
-            3000
-          )
+        ? fetchJSON(`${LI_BASE}/autocomplete?key=${encodeURIComponent(LOCATIONIQ_TOKEN)}&q=ping&limit=1`, {}, 3000)
         : Promise.resolve(),
       RECAPTCHA_SECRET
-        ? fetchJSON(
-            'https://www.google.com/recaptcha/api/siteverify',
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: `secret=${encodeURIComponent(RECAPTCHA_SECRET)}&response=dummy`
-            },
-            3000
-          )
+        ? fetchJSON('https://www.google.com/recaptcha/api/siteverify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `secret=${encodeURIComponent(RECAPTCHA_SECRET)}&response=dummy`
+          }, 3000)
         : Promise.resolve()
     ]);
     res.json({ ok: true });
@@ -235,10 +243,8 @@ app.get('/warm', async (_req, res) => {
 });
 
 /* =========================
-   AI BLOG WRITER
+   Blog writer (OpenAI + Supabase)
    ========================= */
-
-// Utilities
 const slugify = (s) =>
   s
     .toLowerCase()
@@ -258,7 +264,7 @@ const TOPIC_POOL = [
   'How we’re mapping courts (data process + roadmap)',
   'Community spotlight: user-submitted courts this week',
   'Seasonal prep: winter hooping options & indoor passes',
-  'Pro tips: stretching and warm-ups to avoid injury'
+  'Pro tips: stretching and warm-ups to avoid injury',
 ];
 
 async function pickTopic() {
@@ -281,20 +287,40 @@ async function openaiChat(system, user) {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
     },
     body: JSON.stringify({
       model: MODEL_NAME,
       messages: [
         { role: 'system', content: system },
-        { role: 'user', content: user }
+        { role: 'user', content: user },
       ],
-      temperature: 0.8
-    })
+      temperature: 0.8,
+    }),
   });
   if (!resp.ok) throw new Error(`[OpenAI] ${resp.status} ${await resp.text()}`);
   const json = await resp.json();
   return json.choices?.[0]?.message?.content || '';
+}
+
+// optional: store hero images in Supabase Storage for stable URLs
+async function uploadToStorageFromUrl({ fileUrl, bucket, path }) {
+  try {
+    const resp = await fetch(fileUrl);
+    if (!resp.ok) throw new Error(`Image fetch ${resp.status}`);
+    const arrayBuf = await resp.arrayBuffer();
+    const contentType = resp.headers.get('content-type') || 'image/jpeg';
+    const { error: upErr } = await supabase
+      .storage
+      .from(bucket)
+      .upload(path, new Uint8Array(arrayBuf), { contentType, upsert: true });
+    if (upErr) throw upErr;
+    const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+    return data.publicUrl;
+  } catch (e) {
+    console.warn('[hero upload] falling back to source URL:', e.message || e);
+    return null;
+  }
 }
 
 async function generatePost(topic) {
@@ -314,17 +340,14 @@ async function generatePost(topic) {
 
   const tagsLine = body.match(/^\s*Tags:\s*(.+)$/im)?.[1] || '';
   const tags = tagsLine
-    ? tags
-        .split(',')
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean)
+    ? tagsLine.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
     : [];
   const content = body.replace(/^\s*Tags:\s*.+$/im, '').trim();
 
   return { excerpt, content, tags };
 }
 
-// Ensure unique slug by checking DB; append -1, -2, ... if taken
+// Ensure unique slug
 async function ensureUniqueSlug(slugBase, limit = 50) {
   let candidate = slugBase;
   for (let i = 0; i < limit; i++) {
@@ -334,17 +357,13 @@ async function ensureUniqueSlug(slugBase, limit = 50) {
       .eq('slug', candidate)
       .maybeSingle();
 
-    // Not found -> good to use
     if (!data && (error?.code === 'PGRST116' || !error)) return candidate;
-
-    // If found or ambiguous, try next
     candidate = `${slugBase}-${i + 1}`;
   }
-  // Absolute fallback: timestamp
   return `${slugBase}-${Date.now()}`;
 }
 
-// Month range & count helpers (UTC)
+// Month range & count helpers
 function getMonthRangeUTC(date = new Date()) {
   const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0));
   const end = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1, 0, 0, 0));
@@ -362,27 +381,18 @@ async function countPostsThisMonth() {
   return count || 0;
 }
 
-// POST /api/auto-post (secured by X-Cron-Secret or ?secret=)
+// POST /api/auto-post (cron-protected)
 app.post('/api/auto-post', async (req, res) => {
   try {
     if (!CRON_SECRET) return res.status(500).json({ error: 'Missing CRON_SECRET' });
     const secret = req.headers['x-cron-secret'] || req.query.secret;
-    if (secret !== CRON_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
-      return res.status(500).json({ error: 'Supabase env missing' });
-    }
+    if (secret !== CRON_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) return res.status(500).json({ error: 'Supabase env missing' });
 
-    // Soft monthly limit
     if (MAX_POSTS_PER_MONTH > 0) {
       const count = await countPostsThisMonth();
       if (count >= MAX_POSTS_PER_MONTH) {
-        return res.status(429).json({
-          error: 'Monthly post limit reached',
-          limit: MAX_POSTS_PER_MONTH,
-          currentMonthCount: count
-        });
+        return res.status(429).json({ error: 'Monthly post limit reached', limit: MAX_POSTS_PER_MONTH, currentMonthCount: count });
       }
     }
 
@@ -392,24 +402,19 @@ app.post('/api/auto-post', async (req, res) => {
     const slug = await ensureUniqueSlug(base);
 
     const { excerpt, content, tags } = await generatePost(topic);
-    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(
-      title.slice(0, 50)
-    )}`;
-    const now = new Date().toISOString();
 
-    const { error } = await supabase.from('posts').insert([
-      {
-        title,
-        slug,
-        excerpt,
-        content,
-        hero_url,
-        category: 'Guide',
-        tags,
-        published_at: now,
-        updated_at: now
-      }
-    ]);
+    // prepare hero image
+    const seed = encodeURIComponent(title.slice(0, 50));
+    const sourceUrl = `https://source.unsplash.com/featured/?basketball,court,${seed}`;
+    const imgPath = `covers/${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
+    const uploaded = await uploadToStorageFromUrl({ fileUrl: sourceUrl, bucket: 'blog-images', path: imgPath });
+    const hero_url = uploaded || sourceUrl;
+
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('posts').insert([{
+      title, slug, excerpt, content, hero_url,
+      category: 'Guide', tags, published_at: now, updated_at: now
+    }]);
     if (error) throw error;
 
     res.json({ ok: true, title, slug, tags });
@@ -419,23 +424,16 @@ app.post('/api/auto-post', async (req, res) => {
   }
 });
 
-// GET /api/auto-post-test (browser-friendly)
+// GET /api/auto-post-test (query-only)
 app.get('/api/auto-post-test', async (req, res) => {
   try {
     if (!CRON_SECRET) return res.status(500).json({ error: 'Missing CRON_SECRET' });
-    const secret = req.query.secret;
-    if (secret !== CRON_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (req.query.secret !== CRON_SECRET) return res.status(401).json({ error: 'Unauthorized' });
 
     if (MAX_POSTS_PER_MONTH > 0) {
       const count = await countPostsThisMonth();
       if (count >= MAX_POSTS_PER_MONTH) {
-        return res.status(429).json({
-          error: 'Monthly post limit reached',
-          limit: MAX_POSTS_PER_MONTH,
-          currentMonthCount: count
-        });
+        return res.status(429).json({ error: 'Monthly post limit reached', limit: MAX_POSTS_PER_MONTH, currentMonthCount: count });
       }
     }
 
@@ -445,24 +443,18 @@ app.get('/api/auto-post-test', async (req, res) => {
     const slug = await ensureUniqueSlug(base);
 
     const { excerpt, content, tags } = await generatePost(topic);
-    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(
-      title.slice(0, 50)
-    )}`;
-    const now = new Date().toISOString();
 
-    const { error } = await supabase.from('posts').insert([
-      {
-        title,
-        slug,
-        excerpt,
-        content,
-        hero_url,
-        category: 'Guide',
-        tags,
-        published_at: now,
-        updated_at: now
-      }
-    ]);
+    const seed = encodeURIComponent(title.slice(0, 50));
+    const sourceUrl = `https://source.unsplash.com/featured/?basketball,court,${seed}`;
+    const imgPath = `covers/${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
+    const uploaded = await uploadToStorageFromUrl({ fileUrl: sourceUrl, bucket: 'blog-images', path: imgPath });
+    const hero_url = uploaded || sourceUrl;
+
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('posts').insert([{
+      title, slug, excerpt, content, hero_url,
+      category: 'Guide', tags, published_at: now, updated_at: now
+    }]);
     if (error) throw error;
 
     res.json({ ok: true, title, slug, tags, via: 'GET-test' });
@@ -473,7 +465,7 @@ app.get('/api/auto-post-test', async (req, res) => {
 });
 
 /* =========================
-   Env check (booleans only)
+   Env check
    ========================= */
 app.get('/env-check', (_req, res) => {
   res.json({
@@ -484,19 +476,20 @@ app.get('/env-check', (_req, res) => {
     MODEL_NAME,
     MAX_POSTS_PER_MONTH: MAX_POSTS_PER_MONTH || 0,
     LOCATIONIQ_TOKEN: !!LOCATIONIQ_TOKEN,
+    LOCATIONIQ_REGION,
     RECAPTCHA_SECRET: !!RECAPTCHA_SECRET
   });
 });
 
 /* =========================
-   POSTS STATS & COST ESTIMATE
+   Posts stats & cost
    ========================= */
 const PRICING = {
   model: MODEL_NAME,
-  input_per_1k: 0.0006,   // $/1k tokens
-  output_per_1k: 0.0024,  // $/1k tokens
-  prompt_tokens: 400,     // est
-  completion_tokens: 5000 // est for 800–1200 words
+  input_per_1k: 0.0006,
+  output_per_1k: 0.0024,
+  prompt_tokens: 400,
+  completion_tokens: 5000
 };
 
 function estimateCostPerPostUSD() {
