@@ -38,13 +38,14 @@ const httpAgent  = new HttpAgent({ keepAlive: true, maxSockets: 50, keepAliveMse
 const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 50, keepAliveMsecs: 10_000 });
 
 // Tiny cache (LRU)
-const cache = new LRU({
-  max: 500,
-  ttl: 1000 * 60 * 3, // default 3 min
-});
+const cache = new LRU({ max: 500, ttl: 1000 * 60 * 3 });
 
-// Boot log (helps confirm latest deploy)
-console.log('[boot]', new Date().toISOString(), 'routes: /health /env-check /api/autocomplete /api/geocode /api/verify-captcha /warm /api/auto-post /api/auto-post-test');
+// Boot log
+console.log(
+  '[boot]',
+  new Date().toISOString(),
+  'routes: /health /env-check /posts-stats /api/autocomplete /api/geocode /api/verify-captcha /warm /api/auto-post /api/auto-post-test'
+);
 
 // Health
 app.get('/health', (_req, res) => {
@@ -73,7 +74,10 @@ async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
   }
 }
 
-// Autocomplete (cached ~2 min)
+/* =========================
+   LocationIQ proxy routes
+   ========================= */
+
 app.get('/api/autocomplete', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: 'Missing query' });
@@ -86,7 +90,9 @@ app.get('/api/autocomplete', async (req, res) => {
   }
 
   try {
-    const url = `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(q)}&format=json`;
+    const url = `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(
+      q
+    )}&format=json`;
     const data = await fetchJSON(url);
     cache.set(key, data, { ttl: 1000 * 60 * 2 });
     res.set('Cache-Control', 'public, max-age=120');
@@ -97,7 +103,6 @@ app.get('/api/autocomplete', async (req, res) => {
   }
 });
 
-// Geocode (cached ~5 min)
 app.get('/api/geocode', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: 'Missing query' });
@@ -110,7 +115,9 @@ app.get('/api/geocode', async (req, res) => {
   }
 
   try {
-    const url = `https://us1.locationiq.com/v1/search.php?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(q)}&format=json`;
+    const url = `https://us1.locationiq.com/v1/search.php?key=${LOCATIONIQ_API_KEY}&q=${encodeURIComponent(
+      q
+    )}&format=json`;
     const data = await fetchJSON(url);
     cache.set(key, data, { ttl: 1000 * 60 * 5 });
     res.set('Cache-Control', 'public, max-age=300');
@@ -121,7 +128,6 @@ app.get('/api/geocode', async (req, res) => {
   }
 });
 
-// reCAPTCHA verification
 app.post('/api/verify-captcha', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Missing token' });
@@ -144,30 +150,38 @@ app.post('/api/verify-captcha', async (req, res) => {
   }
 });
 
-// Optional: deep warm route
 app.get('/warm', async (_req, res) => {
   try {
     await Promise.allSettled([
-      fetchJSON(`https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=ping&format=json`, {}, 3000),
-      fetchJSON(`https://www.google.com/recaptcha/api/siteverify`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `secret=${RECAPTCHA_SECRET}&response=dummy`,
-      }, 3000),
+      fetchJSON(
+        `https://us1.locationiq.com/v1/autocomplete?key=${LOCATIONIQ_API_KEY}&q=ping&format=json`,
+        {},
+        3000
+      ),
+      fetchJSON(
+        `https://www.google.com/recaptcha/api/siteverify`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `secret=${RECAPTCHA_SECRET}&response=dummy`,
+        },
+        3000
+      ),
     ]);
     res.json({ ok: true });
   } catch {
-    res.json({ ok: true }); // don’t fail warmups
+    res.json({ ok: true });
   }
 });
 
 /* =========================
-   AI BLOG WRITER ENDPOINT
+   AI BLOG WRITER
    ========================= */
 
 // Utilities
 const slugify = (s) =>
-  s.toLowerCase()
+  s
+    .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')
     .trim()
     .replace(/\s+/g, '-')
@@ -192,12 +206,14 @@ async function pickTopic() {
     .from('posts')
     .select('slug')
     .order('published_at', { ascending: false })
-    .limit(200);
+    .limit(500);
+
   const existing = new Set((posts || []).map((p) => p.slug));
   for (const t of TOPIC_POOL) {
     if (!existing.has(slugify(t))) return t;
   }
-  return `${TOPIC_POOL[0]} (${new Date().toISOString().slice(0,10)})`;
+  // Fallback: append date so it’s always new
+  return `${TOPIC_POOL[0]} ${new Date().toISOString().slice(0, 10)}`;
 }
 
 async function openaiChat(system, user) {
@@ -210,7 +226,10 @@ async function openaiChat(system, user) {
     },
     body: JSON.stringify({
       model: MODEL_NAME,
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
       temperature: 0.8,
     }),
   });
@@ -243,7 +262,27 @@ async function generatePost(topic) {
   return { excerpt, content, tags };
 }
 
-// POST /api/auto-post  (secured by X-Cron-Secret)
+// Ensure unique slug by checking DB; append -1, -2, ... if taken
+async function ensureUniqueSlug(slugBase, limit = 50) {
+  let candidate = slugBase;
+  for (let i = 0; i < limit; i++) {
+    const { data, error } = await supabase
+      .from('posts')
+      .select('id')
+      .eq('slug', candidate)
+      .maybeSingle();
+
+    // Not found -> good to use
+    if (!data && (error?.code === 'PGRST116' || !error)) return candidate;
+
+    // If found or ambiguous, try next
+    candidate = `${slugBase}-${i + 1}`;
+  }
+  // Absolute fallback: timestamp
+  return `${slugBase}-${Date.now()}`;
+}
+
+// POST /api/auto-post (secured by X-Cron-Secret or ?secret=)
 app.post('/api/auto-post', async (req, res) => {
   try {
     const secret = req.headers['x-cron-secret'] || req.query.secret;
@@ -256,23 +295,28 @@ app.post('/api/auto-post', async (req, res) => {
 
     const topic = (req.body && req.body.topic) || (await pickTopic());
     const title = (req.body && req.body.title) || topic;
-    const slug  = slugify(title);
+    const base = slugify(title);
+    const slug = await ensureUniqueSlug(base);
 
     const { excerpt, content, tags } = await generatePost(topic);
-    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(title.slice(0,50))}`;
+    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(
+      title.slice(0, 50)
+    )}`;
     const now = new Date().toISOString();
 
-    const { error } = await supabase.from('posts').insert([{
-      title,
-      slug,
-      excerpt,
-      content,
-      hero_url,
-      category: 'Guide',
-      tags,
-      published_at: now,
-      updated_at: now,
-    }]);
+    const { error } = await supabase.from('posts').insert([
+      {
+        title,
+        slug,
+        excerpt,
+        content,
+        hero_url,
+        category: 'Guide',
+        tags,
+        published_at: now,
+        updated_at: now,
+      },
+    ]);
     if (error) throw error;
 
     res.json({ ok: true, title, slug, tags });
@@ -292,16 +336,28 @@ app.get('/api/auto-post-test', async (req, res) => {
 
     const topic = req.query.topic || (await pickTopic());
     const title = req.query.title || topic;
-    const slug  = slugify(title);
+    const base = slugify(title);
+    const slug = await ensureUniqueSlug(base);
 
     const { excerpt, content, tags } = await generatePost(topic);
-    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(title.slice(0,50))}`;
+    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(
+      title.slice(0, 50)
+    )}`;
     const now = new Date().toISOString();
 
-    const { error } = await supabase.from('posts').insert([{
-      title, slug, excerpt, content, hero_url, category: 'Guide', tags,
-      published_at: now, updated_at: now,
-    }]);
+    const { error } = await supabase.from('posts').insert([
+      {
+        title,
+        slug,
+        excerpt,
+        content,
+        hero_url,
+        category: 'Guide',
+        tags,
+        published_at: now,
+        updated_at: now,
+      },
+    ]);
     if (error) throw error;
 
     res.json({ ok: true, title, slug, tags, via: 'GET-test' });
@@ -320,6 +376,70 @@ app.get('/env-check', (_req, res) => {
     SUPABASE_SERVICE_ROLE: !!process.env.SUPABASE_SERVICE_ROLE,
     MODEL_NAME: process.env.MODEL_NAME || null,
   });
+});
+
+/* =========================
+   POSTS STATS & COST ESTIMATE
+   ========================= */
+
+// simple month range in UTC
+function getMonthRangeUTC(date = new Date()) {
+  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0));
+  const end = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1, 0, 0, 0));
+  return { start, end };
+}
+
+// rough cost model (Aug 2025): gpt-4o-mini
+const PRICING = {
+  model: MODEL_NAME,
+  input_per_1k: 0.0006,   // $/1k tokens
+  output_per_1k: 0.0024,  // $/1k tokens
+  prompt_tokens: 400,     // est
+  completion_tokens: 5000 // est for 800–1200 words
+};
+
+function estimateCostPerPostUSD() {
+  const inputCost  = (PRICING.prompt_tokens / 1000)    * PRICING.input_per_1k;
+  const outputCost = (PRICING.completion_tokens / 1000) * PRICING.output_per_1k;
+  return +(inputCost + outputCost).toFixed(4);
+}
+
+// GET /posts-stats — count this month's posts + estimated cost
+app.get('/posts-stats', async (_req, res) => {
+  try {
+    const { start, end } = getMonthRangeUTC(new Date());
+    const startISO = start.toISOString();
+    const endISO = end.toISOString();
+
+    const { count, error } = await supabase
+      .from('posts')
+      .select('id', { count: 'exact', head: true })
+      .gte('published_at', startISO)
+      .lt('published_at', endISO);
+
+    if (error) throw error;
+
+    const perPost = estimateCostPerPostUSD();
+    const total = +((count || 0) * perPost).toFixed(4);
+
+    res.json({
+      monthStartUTC: startISO,
+      monthEndUTC: endISO,
+      postsThisMonth: count || 0,
+      estCostPerPostUSD: perPost,
+      estMonthlyCostUSD: total,
+      pricing: {
+        model: PRICING.model,
+        input_per_1k_usd: PRICING.input_per_1k,
+        output_per_1k_usd: PRICING.output_per_1k,
+        prompt_tokens_est: PRICING.prompt_tokens,
+        completion_tokens_est: PRICING.completion_tokens,
+      },
+    });
+  } catch (err) {
+    console.error('[posts-stats]', err.message || err);
+    res.status(500).json({ error: err.message || 'Failed' });
+  }
 });
 
 // Start server
