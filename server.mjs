@@ -34,6 +34,7 @@ const RECAPTCHA_SECRET      = (process.env.RECAPTCHA_SECRET || '').trim();
 
 const LOCATIONIQ_TOKEN      = (process.env.LOCATIONIQ_TOKEN || '').trim();
 const LOCATIONIQ_REGION     = (process.env.LOCATIONIQ_REGION || 'us1').trim(); // 'us1' or 'eu1'
+const LOCATIONIQ_REFERER    = (process.env.LOCATIONIQ_REFERER || 'https://www.hoopmap.net').trim();
 const LI_BASE               = `https://${LOCATIONIQ_REGION}.locationiq.com/v1`;
 
 const MODEL_NAME            = process.env.MODEL_NAME || 'gpt-4o-mini';
@@ -64,7 +65,7 @@ console.log('[boot]', new Date().toISOString(), {
     '/api/autocomplete', '/api/geocode', '/api/verify-captcha',
     '/warm', '/api/auto-post', '/api/auto-post-test'
   ],
-  LOCATIONIQ: { present: !!LOCATIONIQ_TOKEN, region: LOCATIONIQ_REGION }
+  LOCATIONIQ: { present: !!LOCATIONIQ_TOKEN, region: LOCATIONIQ_REGION, referer: LOCATIONIQ_REFERER }
 });
 
 /* =========================
@@ -97,7 +98,11 @@ async function fetchWithDiagnostics(url, opts = {}, timeoutMs = 8000) {
     const resp = await fetch(url, {
       ...opts,
       signal: controller.signal,
-      headers: { 'User-Agent': 'HoopMap/1.0', ...(opts.headers || {}) }
+      headers: {
+        'User-Agent': 'HoopMap/1.0',
+        'Referer': LOCATIONIQ_REFERER,           // <-- Option A: send Referer for token referrer checks
+        ...(opts.headers || {})
+      }
     });
     const text = await resp.text();
     let json; try { json = JSON.parse(text); } catch { json = null; }
@@ -226,7 +231,7 @@ app.get('/warm', async (_req, res) => {
   try {
     await Promise.allSettled([
       LOCATIONIQ_TOKEN
-        ? fetchJSON(`${LI_BASE}/autocomplete?key=${encodeURIComponent(LOCATIONIQ_TOKEN)}&q=ping&limit=1`, {}, 3000)
+        ? fetchWithDiagnostics(`${LI_BASE}/autocomplete?key=${encodeURIComponent(LOCATIONIQ_TOKEN)}&q=ping&limit=1`, {}, 3000)
         : Promise.resolve(),
       RECAPTCHA_SECRET
         ? fetchJSON('https://www.google.com/recaptcha/api/siteverify', {
@@ -476,7 +481,8 @@ app.get('/env-check', (_req, res) => {
     MODEL_NAME,
     MAX_POSTS_PER_MONTH: MAX_POSTS_PER_MONTH || 0,
     LOCATIONIQ_TOKEN: !!LOCATIONIQ_TOKEN,
-    LOCATIONIQ_REGION,
+    LOCATIONIQ_REGION: LOCATIONIQ_REGION,
+    LOCATIONIQ_REFERER: LOCATIONIQ_REFERER,
     RECAPTCHA_SECRET: !!RECAPTCHA_SECRET
   });
 });
