@@ -11,7 +11,6 @@ import { Agent as HttpAgent } from 'http';
 import { Agent as HttpsAgent } from 'https';
 import { createClient } from '@supabase/supabase-js';
 
-// Express
 const app = express();
 
 // Middleware
@@ -44,6 +43,9 @@ const cache = new LRU({
   ttl: 1000 * 60 * 3, // default 3 min
 });
 
+// Boot log (helps confirm latest deploy)
+console.log('[boot]', new Date().toISOString(), 'routes: /health /env-check /api/autocomplete /api/geocode /api/verify-captcha /warm /api/auto-post /api/auto-post-test');
+
 // Health
 app.get('/health', (_req, res) => {
   res.set('Cache-Control', 'no-store');
@@ -54,7 +56,6 @@ app.get('/health', (_req, res) => {
 async function fetchJSON(url, opts = {}, timeoutMs = 6000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
     const isHttps = url.startsWith('https:');
     const resp = await fetch(url, {
@@ -222,7 +223,7 @@ async function generatePost(topic) {
   const system = `You write for HoopMap's "Courtside" blog. Audience: casual hoopers. Tone: practical, upbeat. Output Markdown only.`;
   const prompt = `Write an 800–1200 word post about "${topic}".
 - Start with a 1–2 sentence excerpt delimited by <<<excerpt>>> ... <<<end>>>
-- Use H2s for sections; lists where helpful
+- Use H2s for sections; lists when helpful
 - End with "Tags: a, b, c" (5 tags max)
 - Do NOT include a title in the body`;
 
@@ -261,19 +262,17 @@ app.post('/api/auto-post', async (req, res) => {
     const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(title.slice(0,50))}`;
     const now = new Date().toISOString();
 
-    const { error } = await supabase.from('posts').insert([
-      {
-        title,
-        slug,
-        excerpt,
-        content,
-        hero_url,
-        category: 'Guide',
-        tags,
-        published_at: now,
-        updated_at: now,
-      },
-    ]);
+    const { error } = await supabase.from('posts').insert([{
+      title,
+      slug,
+      excerpt,
+      content,
+      hero_url,
+      category: 'Guide',
+      tags,
+      published_at: now,
+      updated_at: now,
+    }]);
     if (error) throw error;
 
     res.json({ ok: true, title, slug, tags });
@@ -281,6 +280,46 @@ app.post('/api/auto-post', async (req, res) => {
     console.error('[auto-post]', err.message || err);
     res.status(500).json({ error: err.message || 'Failed' });
   }
+});
+
+// GET /api/auto-post-test (browser-friendly)
+app.get('/api/auto-post-test', async (req, res) => {
+  try {
+    const secret = req.query.secret;
+    if (secret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const topic = req.query.topic || (await pickTopic());
+    const title = req.query.title || topic;
+    const slug  = slugify(title);
+
+    const { excerpt, content, tags } = await generatePost(topic);
+    const hero_url = `https://source.unsplash.com/featured/?basketball,court,${encodeURIComponent(title.slice(0,50))}`;
+    const now = new Date().toISOString();
+
+    const { error } = await supabase.from('posts').insert([{
+      title, slug, excerpt, content, hero_url, category: 'Guide', tags,
+      published_at: now, updated_at: now,
+    }]);
+    if (error) throw error;
+
+    res.json({ ok: true, title, slug, tags, via: 'GET-test' });
+  } catch (err) {
+    console.error('[auto-post-test]', err.message || err);
+    res.status(500).json({ error: err.message || 'Failed' });
+  }
+});
+
+// Env check (booleans only)
+app.get('/env-check', (_req, res) => {
+  res.json({
+    OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+    CRON_SECRET: !!process.env.CRON_SECRET,
+    SUPABASE_URL: !!process.env.SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE: !!process.env.SUPABASE_SERVICE_ROLE,
+    MODEL_NAME: process.env.MODEL_NAME || null,
+  });
 });
 
 // Start server
