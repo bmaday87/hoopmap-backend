@@ -40,6 +40,9 @@ const LI_BASE               = `https://${LOCATIONIQ_REGION}.locationiq.com/v1`;
 const MODEL_NAME            = process.env.MODEL_NAME || 'gpt-4o-mini';
 const MAX_POSTS_PER_MONTH   = Number(process.env.MAX_POSTS_PER_MONTH || 0); // 0 = unlimited
 
+// NEW: configurable blog images bucket
+const BLOG_IMAGES_BUCKET    = (process.env.BLOG_IMAGES_BUCKET || 'blog-images').trim();
+
 /* =========================
    Supabase Client (service role)
    ========================= */
@@ -65,7 +68,8 @@ console.log('[boot]', new Date().toISOString(), {
     '/api/autocomplete', '/api/geocode', '/api/verify-captcha',
     '/warm', '/api/auto-post', '/api/auto-post-test'
   ],
-  LOCATIONIQ: { present: !!LOCATIONIQ_TOKEN, region: LOCATIONIQ_REGION, referer: LOCATIONIQ_REFERER }
+  LOCATIONIQ: { present: !!LOCATIONIQ_TOKEN, region: LOCATIONIQ_REGION, referer: LOCATIONIQ_REFERER },
+  BLOG_IMAGES_BUCKET
 });
 
 /* =========================
@@ -100,7 +104,7 @@ async function fetchWithDiagnostics(url, opts = {}, timeoutMs = 8000) {
       signal: controller.signal,
       headers: {
         'User-Agent': 'HoopMap/1.0',
-        'Referer': LOCATIONIQ_REFERER,           // <-- Option A: send Referer for token referrer checks
+        'Referer': LOCATIONIQ_REFERER,
         ...(opts.headers || {})
       }
     });
@@ -125,8 +129,6 @@ app.get('/health', (_req, res) => {
 /* =========================
    LocationIQ proxy
    ========================= */
-
-// Autocomplete (text suggestions)
 app.get('/api/autocomplete', async (req, res) => {
   try {
     if (!LOCATIONIQ_TOKEN) return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
@@ -162,7 +164,6 @@ app.get('/api/autocomplete', async (req, res) => {
   }
 });
 
-// Geocode (text forward OR "lat,lon" reverse)
 app.get('/api/geocode', async (req, res) => {
   try {
     if (!LOCATIONIQ_TOKEN) return res.status(500).json({ error: 'Missing LOCATIONIQ_TOKEN' });
@@ -170,7 +171,6 @@ app.get('/api/geocode', async (req, res) => {
     const qRaw = (req.query.q || '').toString().trim();
     if (!qRaw) return res.status(400).json({ error: 'Missing query' });
 
-    // detect coords ("lat,lon")
     const m = qRaw.match(/^\s*(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)\s*$/);
     let url;
 
@@ -308,25 +308,61 @@ async function openaiChat(system, user) {
   return json.choices?.[0]?.message?.content || '';
 }
 
-// optional: store hero images in Supabase Storage for stable URLs
-async function uploadToStorageFromUrl({ fileUrl, bucket, path }) {
-  try {
-    const resp = await fetch(fileUrl);
-    if (!resp.ok) throw new Error(`Image fetch ${resp.status}`);
-    const arrayBuf = await resp.arrayBuffer();
-    const contentType = resp.headers.get('content-type') || 'image/jpeg';
-    const { error: upErr } = await supabase
-      .storage
-      .from(bucket)
-      .upload(path, new Uint8Array(arrayBuf), { contentType, upsert: true });
-    if (upErr) throw upErr;
-    const { data } = supabase.storage.from(bucket).getPublicUrl(path);
-    return data.publicUrl;
-  } catch (e) {
-    console.warn('[hero upload] falling back to source URL:', e.message || e);
-    return null;
+/* ========= NEW: bucket ensure + better hero upload ========= */
+
+async function ensureBucket(bucketName = BLOG_IMAGES_BUCKET) {
+  // List buckets and create if missing (idempotent)
+  const { data: list, error: listErr } = await supabase.storage.listBuckets();
+  if (listErr) {
+    console.warn('[bucket] list error (continuing):', listErr.message || listErr);
+    return; // not fatal; upload may still work if bucket exists
+  }
+  const exists = (list || []).some((b) => b.name === bucketName);
+  if (!exists) {
+    const { error: createErr } = await supabase.storage.createBucket(bucketName, {
+      public: true,         // public read
+      fileSizeLimit: '10MB' // reasonable default
+    });
+    if (createErr && !/duplicate/i.test(createErr.message || '')) {
+      console.warn('[bucket] create error:', createErr.message || createErr);
+    } else if (!createErr) {
+      console.log('[bucket] created', bucketName);
+    }
   }
 }
+
+function extFromContentType(ct = '') {
+  if (ct.includes('jpeg')) return 'jpg';
+  if (ct.includes('png')) return 'png';
+  if (ct.includes('webp')) return 'webp';
+  if (ct.includes('gif')) return 'gif';
+  return 'jpg';
+}
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function uploadToStorageFromUrl({ fileUrl, bucket = BLOG_IMAGES_BUCKET, path }) {
+  // retry fetch a couple times in case Unsplash Source hiccups
+  let resp;
+  for (let i = 0; i < 3; i++) {
+    resp = await fetch(fileUrl);
+    if (resp.ok) break;
+    await sleep(400 * (i + 1));
+  }
+  if (!resp || !resp.ok) throw new Error(`Image fetch ${resp?.status}`);
+
+  const arrayBuf = await resp.arrayBuffer();
+  const contentType = resp.headers.get('content-type') || 'image/jpeg';
+  const { error: upErr } = await supabase
+    .storage
+    .from(bucket)
+    .upload(path, new Uint8Array(arrayBuf), { contentType, upsert: true, cacheControl: '31536000' });
+  if (upErr) throw upErr;
+  const { data } = supabase.storage.from(bucket).getPublicUrl(path);
+  return data.publicUrl;
+}
+
+/* ========= /NEW ========= */
 
 async function generatePost(topic) {
   const system = `You write for HoopMap's "Courtside" blog. Audience: casual hoopers. Tone: practical, upbeat. Output Markdown only.`;
@@ -408,12 +444,34 @@ app.post('/api/auto-post', async (req, res) => {
 
     const { excerpt, content, tags } = await generatePost(topic);
 
-    // prepare hero image
+    // HERO IMAGE: ensure bucket, build filename with proper extension, upload, fallback
+    await ensureBucket(BLOG_IMAGES_BUCKET);
     const seed = encodeURIComponent(title.slice(0, 50));
     const sourceUrl = `https://source.unsplash.com/featured/?basketball,court,${seed}`;
-    const imgPath = `covers/${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
-    const uploaded = await uploadToStorageFromUrl({ fileUrl: sourceUrl, bucket: 'blog-images', path: imgPath });
-    const hero_url = uploaded || sourceUrl;
+
+    // Probe content-type to pick extension (optional optimization)
+    let ct = 'image/jpeg';
+    try {
+      const head = await fetch(sourceUrl, { method: 'GET', redirect: 'follow' });
+      ct = head.headers.get('content-type') || 'image/jpeg';
+    } catch {}
+    const ext = extFromContentType(ct);
+
+    const stamped = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileSafe = base || `post-${Date.now()}`;
+    const imgPath = `covers/${stamped}-${fileSafe}.${ext}`;
+
+    let hero_url = sourceUrl;
+    try {
+      const uploadedUrl = await uploadToStorageFromUrl({
+        fileUrl: sourceUrl,
+        bucket: BLOG_IMAGES_BUCKET,
+        path: imgPath
+      });
+      if (uploadedUrl) hero_url = uploadedUrl;
+    } catch (e) {
+      console.warn('[hero upload] using source URL fallback:', e.message || e);
+    }
 
     const now = new Date().toISOString();
     const { error } = await supabase.from('posts').insert([{
@@ -422,7 +480,7 @@ app.post('/api/auto-post', async (req, res) => {
     }]);
     if (error) throw error;
 
-    res.json({ ok: true, title, slug, tags });
+    res.json({ ok: true, title, slug, tags, hero_url });
   } catch (err) {
     console.error('[auto-post]', err.message || err);
     res.status(500).json({ error: err.message || 'Failed' });
@@ -449,11 +507,32 @@ app.get('/api/auto-post-test', async (req, res) => {
 
     const { excerpt, content, tags } = await generatePost(topic);
 
+    await ensureBucket(BLOG_IMAGES_BUCKET);
     const seed = encodeURIComponent(title.slice(0, 50));
     const sourceUrl = `https://source.unsplash.com/featured/?basketball,court,${seed}`;
-    const imgPath = `covers/${Date.now()}-${Math.random().toString(36).slice(2)}.jpg`;
-    const uploaded = await uploadToStorageFromUrl({ fileUrl: sourceUrl, bucket: 'blog-images', path: imgPath });
-    const hero_url = uploaded || sourceUrl;
+
+    let ct = 'image/jpeg';
+    try {
+      const head = await fetch(sourceUrl, { method: 'GET', redirect: 'follow' });
+      ct = head.headers.get('content-type') || 'image/jpeg';
+    } catch {}
+    const ext = extFromContentType(ct);
+
+    const stamped = new Date().toISOString().replace(/[:.]/g, '-');
+    const fileSafe = base || `post-${Date.now()}`;
+    const imgPath = `covers/${stamped}-${fileSafe}.${ext}`;
+
+    let hero_url = sourceUrl;
+    try {
+      const uploadedUrl = await uploadToStorageFromUrl({
+        fileUrl: sourceUrl,
+        bucket: BLOG_IMAGES_BUCKET,
+        path: imgPath
+      });
+      if (uploadedUrl) hero_url = uploadedUrl;
+    } catch (e) {
+      console.warn('[hero upload] using source URL fallback:', e.message || e);
+    }
 
     const now = new Date().toISOString();
     const { error } = await supabase.from('posts').insert([{
@@ -462,7 +541,7 @@ app.get('/api/auto-post-test', async (req, res) => {
     }]);
     if (error) throw error;
 
-    res.json({ ok: true, title, slug, tags, via: 'GET-test' });
+    res.json({ ok: true, title, slug, tags, hero_url, via: 'GET-test' });
   } catch (err) {
     console.error('[auto-post-test]', err.message || err);
     res.status(500).json({ error: err.message || 'Failed' });
@@ -483,7 +562,8 @@ app.get('/env-check', (_req, res) => {
     LOCATIONIQ_TOKEN: !!LOCATIONIQ_TOKEN,
     LOCATIONIQ_REGION: LOCATIONIQ_REGION,
     LOCATIONIQ_REFERER: LOCATIONIQ_REFERER,
-    RECAPTCHA_SECRET: !!RECAPTCHA_SECRET
+    RECAPTCHA_SECRET: !!RECAPTCHA_SECRET,
+    BLOG_IMAGES_BUCKET
   });
 });
 

@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "start": "node server.mjs",
     "dev": "node server.mjs"
+  },
+  "engines":{
+    "node": "20.x"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.54.0",
